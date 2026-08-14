@@ -20,10 +20,20 @@ if (WIN32)
     target_link_libraries(FastMedia PRIVATE windowsapp winhttp ole32 oleaut32)
 endif ()
 
-# After every build (CLion Debug/Release included) drop the freshly built DLL
-# into the Java resources so the library picks it up without a manual copy.
+# After every build drop the freshly built DLL into the Java resources
+# and native folder so the library picks it up without a manual copy.
 add_custom_command(TARGET FastMedia POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../resource"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../resource/assets"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../native"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:FastMedia>
-        "${CMAKE_CURRENT_SOURCE_DIR}/../java/resource/assets/FastMedia.dll"
-    COMMENT "Deploying FastMedia.dll -> java/resource/assets")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../resource/FastMedia.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:FastMedia>
+        "${CMAKE_CURRENT_SOURCE_DIR}/../resource/assets/FastMedia.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:FastMedia>
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/FastMedia.dll"
+    COMMENT "Deploying FastMedia.dll -> resource/FastMedia.dll and native/FastMedia.dll")
+

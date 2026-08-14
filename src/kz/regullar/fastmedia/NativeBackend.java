@@ -33,13 +33,13 @@ final class NativeBackend {
     private static final ThreadLocal<PositionInfoStruct> POSITION_BUF =
             ThreadLocal.withInitial(PositionInfoStruct::new);
 
-    private static volatile FastMediaNative lib;
+    private static volatile boolean initialized = false;
 
     private NativeBackend() {
     }
 
     static synchronized void load() {
-        if (lib != null) {
+        if (initialized) {
             return;
         }
         try (InputStream in = NativeBackend.class.getResourceAsStream(DLL_RESOURCE)) {
@@ -49,10 +49,10 @@ final class NativeBackend {
             Path tmp = Files.createTempFile("FastMedia", ".dll");
             tmp.toFile().deleteOnExit();
             Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
-            FastMediaNative loaded = Native.load(tmp.toAbsolutePath().toString(), FastMediaNative.class);
+            FastMediaNative.register(tmp.toAbsolutePath().toString());
             validateLayout();
-            lib = loaded;
-            LOG.log(Level.INFO, "[FastMedia] native library loaded from {0}", tmp);
+            initialized = true;
+            LOG.log(Level.INFO, "[FastMedia] native library loaded from {0} (JNA Direct Mapping)", tmp);
         } catch (UnsatisfiedLinkError e) {
             throw new IllegalStateException("Failed to load FastMedia.dll: " + e.getMessage(), e);
         } catch (IOException e) {
@@ -60,16 +60,10 @@ final class NativeBackend {
         }
     }
 
-    private static FastMediaNative lib() {
-        FastMediaNative local = lib;
-        if (local == null) {
+    private static void ensureLoaded() {
+        if (!initialized) {
             load();
-            local = lib;
         }
-        if (local == null) {
-            throw new IllegalStateException("FastMedia native library is not initialised");
-        }
-        return local;
     }
 
     private static void validateLayout() {
@@ -87,12 +81,25 @@ final class NativeBackend {
         }
     }
 
+    // --- Push Events (WinRT) ---
+
+    static boolean registerEventCallback(FastMediaNative.MediaEventCallback callback) {
+        ensureLoaded();
+        return FastMediaNative.RegisterMediaEventCallback(callback) != 0;
+    }
+
+    static void unregisterEventCallback() {
+        if (FastMediaNative.isRegistered()) {
+            FastMediaNative.UnregisterMediaEventCallback();
+        }
+    }
+
     // --- Metadata / position ---
 
     static NowPlaying queryNowPlaying() {
-        FastMediaNative l = lib();
+        ensureLoaded();
         MediaInfoStruct s = MEDIA_BUF.get();
-        if (l.GetCurrentMediaInfo(s) == 0) {
+        if (FastMediaNative.GetCurrentMediaInfo(s) == 0) {
             return null;
         }
         try {
@@ -101,73 +108,85 @@ final class NativeBackend {
             return new NowPlaying(s.title(), s.artist(), s.source(), art,
                     s.playing(), s.durationMs, s.positionMs, trackChanged);
         } finally {
-            l.FreeMediaInfo(s);
+            FastMediaNative.FreeMediaInfo(s);
         }
     }
 
     static PlaybackPosition queryPosition() {
-        FastMediaNative l = lib();
+        ensureLoaded();
         PositionInfoStruct s = POSITION_BUF.get();
-        if (l.GetCurrentPositionInfo(s) == 0) {
+        if (FastMediaNative.GetCurrentPositionInfo(s) == 0) {
             return null;
         }
         return new PlaybackPosition(s.playing(), s.durationMs, s.positionMs);
     }
 
     static void clearCache() {
-        lib().ClearCache();
+        ensureLoaded();
+        FastMediaNative.ClearCache();
     }
 
     // --- Transport ---
 
     static boolean play() {
-        return lib().Play() != 0;
+        ensureLoaded();
+        return FastMediaNative.Play() != 0;
     }
 
     static boolean pause() {
-        return lib().Pause() != 0;
+        ensureLoaded();
+        return FastMediaNative.Pause() != 0;
     }
 
     static boolean toggle() {
-        return lib().TogglePlayPause() != 0;
+        ensureLoaded();
+        return FastMediaNative.TogglePlayPause() != 0;
     }
 
     static boolean next() {
-        return lib().SkipNext() != 0;
+        ensureLoaded();
+        return FastMediaNative.SkipNext() != 0;
     }
 
     static boolean previous() {
-        return lib().SkipPrevious() != 0;
+        ensureLoaded();
+        return FastMediaNative.SkipPrevious() != 0;
     }
 
     static boolean seek(long ms) {
-        return lib().SeekToMs(ms) != 0;
+        ensureLoaded();
+        return FastMediaNative.SeekToMs(ms) != 0;
     }
 
     // --- Waveform ---
 
     static boolean startAudioCapture() {
-        return lib().StartAudioCapture() != 0;
+        ensureLoaded();
+        return FastMediaNative.StartAudioCapture() != 0;
     }
 
     static void stopAudioCapture() {
-        lib().StopAudioCapture();
+        if (FastMediaNative.isRegistered()) {
+            FastMediaNative.StopAudioCapture();
+        }
     }
 
     static int waveform(float[] out) {
-        return lib().GetWaveform(out, out.length);
+        ensureLoaded();
+        return FastMediaNative.GetWaveform(out, out.length);
     }
 
     static float audioLevel() {
-        return lib().GetAudioLevel();
+        ensureLoaded();
+        return FastMediaNative.GetAudioLevel();
     }
 
     // --- Lyrics ---
 
     static Lyrics fetchLyrics(String artist, String title) {
-        FastMediaNative l = lib();
+        ensureLoaded();
         LyricsResultStruct result = new LyricsResultStruct();
-        int status = l.FetchLyrics(utf8(artist), utf8(title), result);
+        int status = FastMediaNative.FetchLyrics(utf8(artist), utf8(title), result);
         result.read();
         try {
             if (status != 0) {
@@ -181,7 +200,7 @@ final class NativeBackend {
             List<String> plain = LyricsParser.parsePlain(result.plainText());
             return plain.isEmpty() ? Lyrics.notFound() : Lyrics.plain(plain);
         } finally {
-            l.FreeLyrics(result);
+            FastMediaNative.FreeLyrics(result);
         }
     }
 

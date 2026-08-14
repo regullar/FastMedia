@@ -1,5 +1,6 @@
 package kz.regullar.fastmedia;
 
+import kz.regullar.fastmedia.internal.FastMediaNative;
 import java.text.Normalizer;
 import java.time.Duration;
 import java.util.Locale;
@@ -37,13 +38,9 @@ import java.util.logging.Logger;
 public final class MediaSession implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger(MediaSession.class.getName());
 
-    // Adaptive polling cadence (ms).
-    private static final long TICK_MS = 100L;
-    private static final long METADATA_DISCOVERY_MS = 3_000L;
-    private static final long METADATA_ACTIVE_MS = 5_000L;
-    private static final long METADATA_IDLE_MS = 8_000L;
-    private static final long POSITION_PLAYING_MS = 500L;
-    private static final long POSITION_IDLE_MS = 2_000L;
+    // Lightweight progress updates only while actively playing (ms).
+    private static final long POSITION_PLAYING_TICK_MS = 500L;
+    private static final long HEARTBEAT_FALLBACK_MS = 10_000L;
 
     private static final long LYRICS_NEGATIVE_TTL_MS = 60_000L;
     private static final int LYRICS_CACHE_LIMIT = 128;
@@ -51,7 +48,11 @@ public final class MediaSession implements AutoCloseable {
     private final CopyOnWriteArrayList<MediaListener> listeners = new CopyOnWriteArrayList<>();
 
     private final ScheduledExecutorService monitor;
+    private final ExecutorService eventExecutor;
     private final ExecutorService lyricsExecutor;
+
+    // Strong reference to native callback to prevent GC.
+    private final FastMediaNative.MediaEventCallback nativeCallback = this::onNativeEvent;
 
     private final AtomicBoolean metadataBusy = new AtomicBoolean(false);
     private final AtomicBoolean positionBusy = new AtomicBoolean(false);
@@ -60,19 +61,18 @@ public final class MediaSession implements AutoCloseable {
 
     private volatile boolean hasMedia = false;
     private volatile boolean playing = false;
-    private volatile long nextMetadataAt = 0L;
-    private volatile long nextPositionAt = 0L;
 
     private final ConcurrentHashMap<String, Lyrics> lyricsHits = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> lyricsMisses = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Lyrics>> lyricsInFlight = new ConcurrentHashMap<>();
 
     private MediaSession() {
-        this.monitor = Executors.newScheduledThreadPool(2, r -> daemon(r, "FastMedia-Monitor"));
+        this.monitor = Executors.newSingleThreadScheduledExecutor(r -> daemon(r, "FastMedia-Monitor"));
+        this.eventExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "FastMedia-Events"));
         this.lyricsExecutor = Executors.newSingleThreadExecutor(r -> daemon(r, "FastMedia-Lyrics"));
     }
 
-    /** Loads the native library and starts monitoring. */
+    /** Loads the native library and starts monitoring using WinRT Push Events. */
     public static MediaSession open() {
         NativeBackend.load();
         MediaSession session = new MediaSession();
@@ -81,8 +81,148 @@ public final class MediaSession implements AutoCloseable {
     }
 
     private void startMonitoring() {
-        monitor.scheduleAtFixedRate(this::metadataTick, 0, TICK_MS, TimeUnit.MILLISECONDS);
-        monitor.scheduleAtFixedRate(this::positionTick, TICK_MS / 2, TICK_MS, TimeUnit.MILLISECONDS);
+        // 1. Register WinRT Push Events callback in native backend
+        NativeBackend.registerEventCallback(nativeCallback);
+
+        // 2. Initial state discovery
+        eventExecutor.submit(this::refreshMetadata);
+
+        // 3. Smooth progress ticker (runs only when playing) + relaxed safety heartbeat
+        monitor.scheduleAtFixedRate(this::smoothPositionTick, POSITION_PLAYING_TICK_MS,
+                POSITION_PLAYING_TICK_MS, TimeUnit.MILLISECONDS);
+        monitor.scheduleAtFixedRate(this::heartbeatCheck, HEARTBEAT_FALLBACK_MS,
+                HEARTBEAT_FALLBACK_MS, TimeUnit.MILLISECONDS);
+    }
+
+    // --- WinRT Push Event Handler ---
+
+    private void onNativeEvent(int eventType) {
+        if (closed.get()) {
+            return;
+        }
+        eventExecutor.submit(() -> handleNativeEvent(eventType));
+    }
+
+    private void handleNativeEvent(int eventType) {
+        if (closed.get()) {
+            return;
+        }
+        switch (eventType) {
+            case FastMediaNative.EVENT_MEDIA_PROPERTIES_CHANGED:
+            case FastMediaNative.EVENT_SESSION_CHANGED:
+                refreshMetadata();
+                break;
+            case FastMediaNative.EVENT_PLAYBACK_INFO_CHANGED:
+                refreshPlaybackInfo();
+                break;
+            case FastMediaNative.EVENT_TIMELINE_PROPERTIES_CHANGED:
+                refreshPosition();
+                break;
+            case FastMediaNative.EVENT_PLAYBACK_STOPPED:
+                handlePlaybackStopped();
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void refreshMetadata() {
+        if (closed.get() || !metadataBusy.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            NowPlaying np = NativeBackend.queryNowPlaying();
+            if (np == null || np.title().isEmpty()) {
+                handlePlaybackStopped();
+                return;
+            }
+            boolean firstAppearance = !hasMedia;
+            hasMedia = true;
+            playing = np.isPlaying();
+
+            if (np.trackChanged() || firstAppearance) {
+                dispatch(l -> l.onTrackChanged(np));
+            }
+            PlaybackPosition pos = new PlaybackPosition(np.isPlaying(), np.durationMs(), np.positionMs());
+            dispatch(l -> l.onPositionChanged(pos));
+        } catch (Throwable t) {
+            rethrowIfFatal(t);
+            LOG.log(Level.FINE, "[FastMedia] metadata refresh failed", t);
+        } finally {
+            metadataBusy.set(false);
+        }
+    }
+
+    private void refreshPlaybackInfo() {
+        if (closed.get()) {
+            return;
+        }
+        try {
+            PlaybackPosition pos = NativeBackend.queryPosition();
+            if (pos == null) {
+                handlePlaybackStopped();
+                return;
+            }
+            boolean prevPlaying = playing;
+            playing = pos.playing();
+            hasMedia = true;
+            dispatch(l -> l.onPositionChanged(pos));
+            if (prevPlaying != playing) {
+                refreshMetadata();
+            }
+        } catch (Throwable t) {
+            rethrowIfFatal(t);
+            LOG.log(Level.FINE, "[FastMedia] playback info refresh failed", t);
+        }
+    }
+
+    private void refreshPosition() {
+        if (closed.get()) {
+            return;
+        }
+        try {
+            PlaybackPosition pos = NativeBackend.queryPosition();
+            if (pos != null) {
+                hasMedia = true;
+                playing = pos.playing();
+                dispatch(l -> l.onPositionChanged(pos));
+            }
+        } catch (Throwable t) {
+            rethrowIfFatal(t);
+            LOG.log(Level.FINE, "[FastMedia] position refresh failed", t);
+        }
+    }
+
+    private void handlePlaybackStopped() {
+        if (hasMedia) {
+            hasMedia = false;
+            playing = false;
+            dispatch(MediaListener::onPlaybackStopped);
+        }
+    }
+
+    private void smoothPositionTick() {
+        if (closed.get() || !hasMedia || !playing || !positionBusy.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            PlaybackPosition pos = NativeBackend.queryPosition();
+            if (pos != null && pos.playing()) {
+                dispatch(l -> l.onPositionChanged(pos));
+            }
+        } catch (Throwable t) {
+            rethrowIfFatal(t);
+            LOG.log(Level.FINE, "[FastMedia] smooth position tick failed", t);
+        } finally {
+            positionBusy.set(false);
+        }
+    }
+
+    private void heartbeatCheck() {
+        if (closed.get()) {
+            return;
+        }
+        eventExecutor.submit(this::refreshMetadata);
     }
 
     // --- One-shot queries (always fresh) ---
@@ -231,66 +371,6 @@ public final class MediaSession implements AutoCloseable {
         }
     }
 
-    // --- Monitoring ---
-
-    private void metadataTick() {
-        if (closed.get() || System.currentTimeMillis() < nextMetadataAt
-                || !metadataBusy.compareAndSet(false, true)) {
-            return;
-        }
-        try {
-            NowPlaying np = NativeBackend.queryNowPlaying();
-            long now = System.currentTimeMillis();
-            if (np == null || np.title().isEmpty()) {
-                nextMetadataAt = now + METADATA_DISCOVERY_MS;
-                if (hasMedia) {
-                    hasMedia = false;
-                    playing = false;
-                    dispatch(MediaListener::onPlaybackStopped);
-                }
-                return;
-            }
-            boolean firstAppearance = !hasMedia;
-            hasMedia = true;
-            playing = np.isPlaying();
-            nextMetadataAt = now + (playing ? METADATA_ACTIVE_MS : METADATA_IDLE_MS);
-
-            if (np.trackChanged() || firstAppearance) {
-                dispatch(l -> l.onTrackChanged(np));
-            }
-            PlaybackPosition pos = new PlaybackPosition(np.isPlaying(), np.durationMs(), np.positionMs());
-            dispatch(l -> l.onPositionChanged(pos));
-        } catch (Throwable t) {
-            rethrowIfFatal(t);
-            LOG.log(Level.FINE, "[FastMedia] metadata tick failed", t);
-        } finally {
-            metadataBusy.set(false);
-        }
-    }
-
-    private void positionTick() {
-        if (closed.get() || !hasMedia || System.currentTimeMillis() < nextPositionAt
-                || !positionBusy.compareAndSet(false, true)) {
-            return;
-        }
-        try {
-            PlaybackPosition pos = NativeBackend.queryPosition();
-            long now = System.currentTimeMillis();
-            if (pos == null) {
-                nextPositionAt = now + POSITION_IDLE_MS;
-                return;
-            }
-            playing = pos.playing();
-            nextPositionAt = now + (playing ? POSITION_PLAYING_MS : POSITION_IDLE_MS);
-            dispatch(l -> l.onPositionChanged(pos));
-        } catch (Throwable t) {
-            rethrowIfFatal(t);
-            LOG.log(Level.FINE, "[FastMedia] position tick failed", t);
-        } finally {
-            positionBusy.set(false);
-        }
-    }
-
     private void dispatch(java.util.function.Consumer<MediaListener> action) {
         for (MediaListener listener : listeners) {
             try {
@@ -308,7 +388,9 @@ public final class MediaSession implements AutoCloseable {
             return;
         }
         listeners.clear();
+        NativeBackend.unregisterEventCallback();
         monitor.shutdownNow();
+        eventExecutor.shutdownNow();
         lyricsExecutor.shutdownNow();
         stopWaveform();
         try {

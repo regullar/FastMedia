@@ -27,3 +27,9 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### CMake / C++ Build ###
+cpp/build/
+cpp/cmake-build-*/
+cpp/.idea/
+CMakeSettings.json

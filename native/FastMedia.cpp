@@ -1,21 +1,3 @@
-// FastMedia native backend.
-//
-// Provides three capabilities to the Java layer over a flat C ABI:
-//   1. System media transport control (metadata, position, transport commands)
-//      backed by Windows GlobalSystemMediaTransportControls (SMTC).
-//   2. A real audio-reactive waveform built from live PCM captured through
-//      WASAPI loopback on the default render endpoint.
-//   3. Lyrics retrieval (lrclib.net) over WinHTTP with in-process JSON parsing,
-//      so callers never touch HTTP/JSON themselves.
-//
-// Design notes:
-//   * Critical sections only ever guard small in-memory field updates; every
-//     blocking WinRT/WinHTTP/WASAPI call happens OUTSIDE a lock. That makes
-//     plain std::mutex/lock_guard correct and contention-free, so there is no
-//     busy-wait lock acquisition and no artificial "lock timeout" skips.
-//   * Exported entry points wrap their body in a single SEH guard so a faulty
-//     OS component can never unwind into the JVM.
-
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -966,6 +948,171 @@ extern "C" {
         if (info) { info->albumArtPng = nullptr; info->albumArtSize = 0; }
     }
 
+    // ---------------------------------------------------------------------------
+    // WinRT SMTC Push Events
+    // ---------------------------------------------------------------------------
+
+    typedef void (__stdcall *MediaEventCallback)(int32_t eventType);
+
+    enum MediaEventType {
+        kEventNone = 0,
+        kEventMediaPropertiesChanged = 1,
+        kEventPlaybackInfoChanged = 2,
+        kEventTimelinePropertiesChanged = 3,
+        kEventSessionChanged = 4,
+        kEventPlaybackStopped = 5
+    };
+
+    struct EventState {
+        std::mutex mutex;
+        MediaEventCallback callback = nullptr;
+        GlobalSystemMediaTransportControlsSessionManager manager = nullptr;
+        GlobalSystemMediaTransportControlsSession session = nullptr;
+        winrt::event_token tokenManagerCurrentSessionChanged{};
+        winrt::event_token tokenManagerSessionsChanged{};
+        winrt::event_token tokenMediaPropertiesChanged{};
+        winrt::event_token tokenPlaybackInfoChanged{};
+        winrt::event_token tokenTimelinePropertiesChanged{};
+        bool isRegistered = false;
+    };
+
+    EventState g_eventState;
+
+    static void InvokeCallbackSEH(MediaEventCallback cb, int32_t eventType) {
+        __try {
+            cb(eventType);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    void NotifyJavaEvent(int32_t eventType) {
+        MediaEventCallback cb = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_eventState.mutex);
+            cb = g_eventState.callback;
+        }
+        if (cb) {
+            InvokeCallbackSEH(cb, eventType);
+        }
+    }
+
+    void UnhookSessionEventsLocked() {
+        if (g_eventState.session) {
+            try {
+                if (g_eventState.tokenMediaPropertiesChanged.value != 0) {
+                    g_eventState.session.MediaPropertiesChanged(g_eventState.tokenMediaPropertiesChanged);
+                    g_eventState.tokenMediaPropertiesChanged = {};
+                }
+                if (g_eventState.tokenPlaybackInfoChanged.value != 0) {
+                    g_eventState.session.PlaybackInfoChanged(g_eventState.tokenPlaybackInfoChanged);
+                    g_eventState.tokenPlaybackInfoChanged = {};
+                }
+                if (g_eventState.tokenTimelinePropertiesChanged.value != 0) {
+                    g_eventState.session.TimelinePropertiesChanged(g_eventState.tokenTimelinePropertiesChanged);
+                    g_eventState.tokenTimelinePropertiesChanged = {};
+                }
+            } catch (...) {}
+            g_eventState.session = nullptr;
+        }
+    }
+
+    void HookSessionEventsLocked(const GlobalSystemMediaTransportControlsSession& session) {
+        UnhookSessionEventsLocked();
+        if (!session) return;
+        try {
+            g_eventState.session = session;
+            g_eventState.tokenMediaPropertiesChanged = session.MediaPropertiesChanged(
+                [](auto const&, auto const&) {
+                    NotifyJavaEvent(kEventMediaPropertiesChanged);
+                });
+            g_eventState.tokenPlaybackInfoChanged = session.PlaybackInfoChanged(
+                [](auto const&, auto const&) {
+                    NotifyJavaEvent(kEventPlaybackInfoChanged);
+                });
+            g_eventState.tokenTimelinePropertiesChanged = session.TimelinePropertiesChanged(
+                [](auto const&, auto const&) {
+                    NotifyJavaEvent(kEventTimelinePropertiesChanged);
+                });
+        } catch (...) {
+            UnhookSessionEventsLocked();
+        }
+    }
+
+    void OnSessionManagerEvent() {
+        bool hasSession = false;
+        {
+            std::lock_guard<std::mutex> lock(g_eventState.mutex);
+            if (!g_eventState.isRegistered || !g_eventState.manager) return;
+            try {
+                auto current = g_eventState.manager.GetCurrentSession();
+                HookSessionEventsLocked(current);
+                hasSession = (current != nullptr);
+            } catch (...) {
+                hasSession = false;
+            }
+        }
+        NotifyJavaEvent(hasSession ? kEventSessionChanged : kEventPlaybackStopped);
+    }
+
+    static int32_t __stdcall RegisterMediaEventCallbackBody(MediaEventCallback callback) {
+        if (!EnsureApartment()) return 0;
+        std::lock_guard<std::mutex> lock(g_eventState.mutex);
+        g_eventState.callback = callback;
+        if (g_eventState.isRegistered) return 1;
+
+        try {
+            GlobalSystemMediaTransportControlsSessionManager manager = nullptr;
+            if (!TryGetSessionManager(&manager) || !manager) return 0;
+
+            g_eventState.manager = manager;
+            g_eventState.tokenManagerCurrentSessionChanged = manager.CurrentSessionChanged(
+                [](auto const&, auto const&) {
+                    OnSessionManagerEvent();
+                });
+            g_eventState.tokenManagerSessionsChanged = manager.SessionsChanged(
+                [](auto const&, auto const&) {
+                    OnSessionManagerEvent();
+                });
+
+            auto session = manager.GetCurrentSession();
+            HookSessionEventsLocked(session);
+            g_eventState.isRegistered = true;
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    __declspec(dllexport) int32_t __stdcall RegisterMediaEventCallback(MediaEventCallback callback) {
+        __try { return RegisterMediaEventCallbackBody(callback); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+
+    static void __stdcall UnregisterMediaEventCallbackBody() {
+        std::lock_guard<std::mutex> lock(g_eventState.mutex);
+        if (!g_eventState.isRegistered) return;
+        try {
+            if (g_eventState.manager) {
+                if (g_eventState.tokenManagerCurrentSessionChanged.value != 0) {
+                    g_eventState.manager.CurrentSessionChanged(g_eventState.tokenManagerCurrentSessionChanged);
+                    g_eventState.tokenManagerCurrentSessionChanged = {};
+                }
+                if (g_eventState.tokenManagerSessionsChanged.value != 0) {
+                    g_eventState.manager.SessionsChanged(g_eventState.tokenManagerSessionsChanged);
+                    g_eventState.tokenManagerSessionsChanged = {};
+                }
+                g_eventState.manager = nullptr;
+            }
+            UnhookSessionEventsLocked();
+        } catch (...) {}
+        g_eventState.callback = nullptr;
+        g_eventState.isRegistered = false;
+    }
+
+    __declspec(dllexport) void __stdcall UnregisterMediaEventCallback() {
+        __try { UnregisterMediaEventCallbackBody(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
     static void __stdcall ClearCacheBody() {
         {
             std::lock_guard<std::mutex> lock(Cache().mutex);
@@ -984,6 +1131,10 @@ extern "C" {
             std::lock_guard<std::mutex> lock(State().sessionManagerMutex);
             State().sessionManager = nullptr;
             State().sessionManagerUpdate = {};
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_eventState.mutex);
+            UnhookSessionEventsLocked();
         }
     }
 
