@@ -33,3 +33,4 @@ cpp/build/
 cpp/cmake-build-*/
 cpp/.idea/
 CMakeSettings.json
+resource/assets/
