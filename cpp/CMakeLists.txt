@@ -20,12 +20,35 @@ if (WIN32)
     target_link_libraries(FastMedia PRIVATE windowsapp winhttp ole32 oleaut32)
 endif ()
 
-# After every build drop the freshly built DLL into the Java resources
-# and native folder so the library picks it up without a manual copy.
+if (MSVC)
+    # Aggressive size optimization flags for MSVC
+    target_compile_options(FastMedia PRIVATE
+        $<$<CONFIG:Release>:
+            /O1        # Minimize size
+            /Os        # Favor small code
+            /GL        # Whole Program Optimization
+            /Gy        # Function-level linking
+            /Gw        # Optimize Global Data
+        >
+    )
+    target_link_options(FastMedia PRIVATE
+        $<$<CONFIG:Release>:
+            /LTCG      # Link-Time Code Generation
+            /OPT:REF   # Eliminate unreferenced functions and data
+            /OPT:ICF   # Identical COMDAT folding
+        >
+    )
+endif ()
+
+# Find local UPX packer
+set(UPX_EXE "${CMAKE_CURRENT_SOURCE_DIR}/upx.exe")
+
+# Post-build: Compress with UPX (in Release) and deploy to Java resource directories
 add_custom_command(TARGET FastMedia POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../resource"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../resource/assets"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../native"
+    COMMAND "$<$<CONFIG:Release>:${UPX_EXE}>" "$<$<CONFIG:Release>:--best>" "$<$<CONFIG:Release>:-f>" "$<$<CONFIG:Release>:$<TARGET_FILE:FastMedia>>"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:FastMedia>
         "${CMAKE_CURRENT_SOURCE_DIR}/../resource/FastMedia.dll"
@@ -35,5 +58,6 @@ add_custom_command(TARGET FastMedia POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:FastMedia>
         "${CMAKE_CURRENT_SOURCE_DIR}/../native/FastMedia.dll"
-    COMMENT "Deploying FastMedia.dll -> resource/FastMedia.dll and native/FastMedia.dll")
+    COMMENT "Optimizing, compressing with UPX, and deploying FastMedia.dll")
+
 
