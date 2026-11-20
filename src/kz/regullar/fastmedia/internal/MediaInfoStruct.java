@@ -4,8 +4,6 @@ import com.sun.jna.Pointer;
 import com.sun.jna.Structure;
 
 import java.nio.charset.StandardCharsets;
-
-/** Mirrors the packed native {@code MediaInfo} struct. Internal. */
 @Structure.FieldOrder({"title", "artist", "sourceApp", "albumArtPng", "albumArtSize",
         "isPlaying", "durationMs", "positionMs", "trackChanged"})
 public final class MediaInfoStruct extends Structure {

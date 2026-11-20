@@ -6,28 +6,22 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-/**
- * Turns raw lrclib payloads (LRC text / plain text) into structured lines.
- *
- * <p>This is the only lyrics text processing left in the Java layer; the actual
- * HTTP retrieval and the lrclib JSON live entirely in the native DLL.
- */
 public final class LyricsParser {
 
     private static final Pattern LRC_TIME =
             Pattern.compile("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?]");
+    private static final Pattern LINE_SPLIT = Pattern.compile("\\R");
 
     private LyricsParser() {
     }
 
-    /** Parses LRC text into time-sorted lines; empty when none parse. */
     public static List<LyricLine> parseSynced(String lrc) {
         if (lrc == null || lrc.isBlank()) {
             return List.of();
         }
-        List<LyricLine> lines = new ArrayList<>();
-        for (String raw : lrc.split("\\R", -1)) {
+        String[] rawLines = LINE_SPLIT.split(lrc);
+        List<LyricLine> lines = new ArrayList<>(rawLines.length);
+        for (String raw : rawLines) {
             Matcher m = LRC_TIME.matcher(raw);
             int lastEnd = -1;
             List<Long> times = new ArrayList<>(2);
@@ -51,12 +45,12 @@ public final class LyricsParser {
         return lines;
     }
 
-    /** Splits plain lyrics into lines, trimming trailing blank lines. */
     public static List<String> parsePlain(String text) {
         if (text == null || text.isBlank()) {
             return List.of();
         }
-        List<String> lines = new ArrayList<>(List.of(text.split("\\R", -1)));
+        String[] split = LINE_SPLIT.split(text);
+        List<String> lines = new ArrayList<>(java.util.Arrays.asList(split));
         while (!lines.isEmpty() && lines.get(lines.size() - 1).isBlank()) {
             lines.remove(lines.size() - 1);
         }

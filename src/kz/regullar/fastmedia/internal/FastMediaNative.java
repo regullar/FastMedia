@@ -3,16 +3,6 @@ package kz.regullar.fastmedia.internal;
 import com.sun.jna.Callback;
 import com.sun.jna.Native;
 import com.sun.jna.NativeLibrary;
-
-/**
- * Direct 1:1 JNA Direct Mapping binding to the exported functions of {@code FastMedia.dll}.
- *
- * <p>Direct Mapping eliminates dynamic invocation handlers and proxy reflection overhead,
- * routing calls directly through generated JNI stubs for maximum throughput.
- *
- * <p>This class is internal. Application code uses
- * {@link kz.regullar.fastmedia.MediaSession} instead.
- */
 public final class FastMediaNative {
 
     public interface MediaEventCallback extends Callback {
@@ -50,8 +40,6 @@ public final class FastMediaNative {
     public static boolean isRegistered() {
         return registered;
     }
-
-    // --- Media metadata / position ---
     public static native int GetCurrentMediaInfo(MediaInfoStruct info);
 
     public static native int GetCurrentPositionInfo(PositionInfoStruct info);
@@ -59,13 +47,9 @@ public final class FastMediaNative {
     public static native void FreeMediaInfo(MediaInfoStruct info);
 
     public static native void ClearCache();
-
-    // --- Push Events (WinRT) ---
     public static native int RegisterMediaEventCallback(MediaEventCallback callback);
 
     public static native void UnregisterMediaEventCallback();
-
-    // --- Transport ---
     public static native int Play();
 
     public static native int Pause();
@@ -77,8 +61,6 @@ public final class FastMediaNative {
     public static native int SkipPrevious();
 
     public static native int SeekToMs(long ms);
-
-    // --- Audio waveform (WASAPI loopback) ---
     public static native int StartAudioCapture();
 
     public static native void StopAudioCapture();
@@ -87,9 +69,12 @@ public final class FastMediaNative {
 
     public static native float GetAudioLevel();
 
-    // --- Lyrics ---
-    public static native int FetchLyrics(byte[] artistUtf8, byte[] titleUtf8, LyricsResultStruct out);
+    public static native int RefreshAudioSources();
 
-    public static native void FreeLyrics(LyricsResultStruct result);
+    public static native int GetAudioSource(int index, AudioSourceStruct out);
+
+    public static native int SetWaveformSource(int pid);
+
+    public static native int GetWaveformSourcePid();
 }
 

@@ -1,18 +1,6 @@
 package kz.regullar.fastmedia;
 
 import java.util.List;
-
-/**
- * Result of a lyrics lookup.
- *
- * <p>A lookup yields one of three kinds:
- * <ul>
- *   <li>{@link Kind#SYNCED} — time-synchronised lines (see {@link #syncedLines()});</li>
- *   <li>{@link Kind#PLAIN} — plain text lines (see {@link #plainLines()});</li>
- *   <li>{@link Kind#NONE} — no lyrics were found, or the lookup failed transiently
- *       (distinguished by {@link #available()}).</li>
- * </ul>
- */
 public final class Lyrics {
 
     public enum Kind {SYNCED, PLAIN, NONE}
@@ -32,38 +20,26 @@ public final class Lyrics {
         this.conclusive = conclusive;
     }
 
-    static Lyrics synced(List<LyricLine> lines) {
+    public static Lyrics synced(List<LyricLine> lines) {
         return new Lyrics(Kind.SYNCED, List.copyOf(lines), List.of(), true);
     }
 
-    static Lyrics plain(List<String> lines) {
+    public static Lyrics plain(List<String> lines) {
         return new Lyrics(Kind.PLAIN, List.of(), List.copyOf(lines), true);
     }
-
-    /** Lyrics definitively do not exist (negative result, safe to cache). */
-    static Lyrics notFound() {
+    public static Lyrics notFound() {
         return NOT_FOUND;
     }
-
-    /** Lookup failed transiently (network/parse); retry later. */
-    static Lyrics unavailable() {
+    public static Lyrics unavailable() {
         return UNAVAILABLE;
     }
 
     public Kind kind() {
         return kind;
     }
-
-    /** {@code true} when synced or plain lyrics are present. */
     public boolean isPresent() {
         return kind != Kind.NONE;
     }
-
-    /**
-     * {@code true} when the result is conclusive: either lyrics were found or
-     * they definitively do not exist. {@code false} signals a transient failure
-     * that callers may retry.
-     */
     public boolean available() {
         return isPresent() || conclusive;
     }
@@ -75,11 +51,6 @@ public final class Lyrics {
     public List<String> plainLines() {
         return plainLines;
     }
-
-    /**
-     * Index of the synced line active at {@code positionMs}, or {@code -1} when
-     * there are no synced lines or playback is before the first timestamp.
-     */
     public int activeLineIndex(long positionMs) {
         if (kind != Kind.SYNCED || syncedLines.isEmpty()) {
             return -1;

@@ -1,8 +1,6 @@
 package kz.regullar.fastmedia;
 
 import java.time.Duration;
-
-/** Immutable snapshot of playback position and state. */
 public record PlaybackPosition(boolean playing, long durationMs, long positionMs) {
 
     public Duration duration() {
@@ -13,7 +11,6 @@ public record PlaybackPosition(boolean playing, long durationMs, long positionMs
         return Duration.ofMillis(positionMs);
     }
 
-    /** Progress in {@code [0, 1]}; {@code 0} when the duration is unknown. */
     public float progress() {
         if (durationMs <= 0) {
             return 0f;

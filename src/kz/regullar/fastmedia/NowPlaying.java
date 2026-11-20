@@ -1,15 +1,7 @@
 package kz.regullar.fastmedia;
 
 import java.time.Duration;
-import java.util.Arrays;
 
-/**
- * Immutable snapshot of the currently playing media session.
- *
- * <p>{@link #albumArt()} returns the raw PNG/JPEG bytes of the cover, or
- * {@code null} when no art is available. Defensive copies are made so the
- * snapshot is safe to share across threads.
- */
 public final class NowPlaying {
     private final String title;
     private final String artist;
@@ -40,14 +32,12 @@ public final class NowPlaying {
         return artist;
     }
 
-    /** The app the media originates from (e.g. {@code Spotify}). */
     public String source() {
         return source;
     }
 
-    /** Raw cover image bytes, or {@code null}. A fresh copy is returned each call. */
     public byte[] albumArt() {
-        return albumArt == null ? null : Arrays.copyOf(albumArt, albumArt.length);
+        return albumArt;
     }
 
     public boolean hasAlbumArt() {
@@ -74,7 +64,6 @@ public final class NowPlaying {
         return positionMs;
     }
 
-    /** {@code true} when the track or its cover changed since the previous query. */
     public boolean trackChanged() {
         return trackChanged;
     }

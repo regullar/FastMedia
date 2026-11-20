@@ -7,16 +7,12 @@ public final class Start {
             session.addListener(new MediaListener() {
                 @Override
                 public void onTrackChanged(NowPlaying np) {
-                    System.out.println("\nNow playing: " + np.title() + " — " + np.artist()
-                            + "  [" + np.source() + "]"
-                            + (np.hasAlbumArt() ? "  (cover " + np.albumArt().length + " bytes)" : ""));
+                    System.out.println("\nNow playing: " + np.title() + " — " + np.artist() + "  [" + np.source() + "]" + (np.hasAlbumArt() ? "  (cover " + np.albumArt().length + " bytes)" : ""));
                 }
 
                 @Override
                 public void onPositionChanged(PlaybackPosition pos) {
-                    System.out.printf("\r%s %s / %s   ",
-                            pos.playing() ? "▶" : "⏸",
-                            format(pos.positionMs()), format(pos.durationMs()));
+                    System.out.printf("\r%s %s / %s   ", pos.playing() ? "▶" : "⏸", format(pos.positionMs()), format(pos.durationMs()));
                 }
 
                 @Override
