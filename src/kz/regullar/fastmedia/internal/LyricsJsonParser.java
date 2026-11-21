@@ -1,6 +1,5 @@
 package kz.regullar.fastmedia.internal;
 public final class LyricsJsonParser {
-
     private LyricsJsonParser() {
     }
 

@@ -18,16 +18,10 @@ import java.util.function.IntConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-/**
- * The DLL keeps one process-wide state (event registration, capture thread, caches), so this
- * class owns it: every {@link MediaSession} is a subscriber, and the shared native resources
- * are released only when the last subscriber leaves.
- */
 final class NativeBackend {
     private static final Logger LOG = Logger.getLogger(NativeBackend.class.getName());
     private static final String DLL_RESOURCE = "/FastMedia.dll";
 
-    /** Native return code for "SMTC could not be asked right now" (vs 0 = no media session). */
     private static final int TRANSIENT = -1;
 
     private static final ThreadLocal<MediaInfoStruct> MEDIA_BUF =
@@ -39,8 +33,6 @@ final class NativeBackend {
 
     private static final CopyOnWriteArrayList<IntConsumer> EVENT_SINKS = new CopyOnWriteArrayList<>();
 
-    // Strongly reachable for the life of the class: a WinRT thread may still be inside a
-    // callback after unregistration, so the JNA trampoline must never be collected.
     private static final FastMediaNative.MediaEventCallback EVENT_CALLBACK = type -> {
         for (IntConsumer sink : EVENT_SINKS) {
             try {
@@ -52,11 +44,9 @@ final class NativeBackend {
     };
 
     private static volatile boolean initialized = false;
-    // Guarded by NativeBackend.class
     private static boolean eventsRegistered = false;
     private static int waveformUsers = 0;
 
-    /** SMTC was reachable but did not answer in time; the caller should keep its last state. */
     static final class TransientFailure extends RuntimeException {
         TransientFailure(String message) {
             super(message, null, false, false);
@@ -86,7 +76,6 @@ final class NativeBackend {
                     Files.write(target, dllBytes, StandardOpenOption.CREATE,
                             StandardOpenOption.TRUNCATE_EXISTING);
                 } catch (IOException locked) {
-                    // Another JVM has it mapped: use a private copy instead.
                     target = cacheDir.resolve("FastMedia_" + hash + "_" + ProcessHandle.current().pid() + ".dll");
                     Files.write(target, dllBytes, StandardOpenOption.CREATE,
                             StandardOpenOption.TRUNCATE_EXISTING);
@@ -119,7 +108,6 @@ final class NativeBackend {
 
     private static void validateLayout() {
         if (Native.POINTER_SIZE != 8) {
-            // The exports are __stdcall and only the x64 ABI makes that a no-op for JNA.
             throw new IllegalStateException("FastMedia requires a 64-bit JVM");
         }
         int actualMedia = new MediaInfoStruct().size();
@@ -139,11 +127,6 @@ final class NativeBackend {
         }
     }
 
-    /**
-     * Subscribes to SMTC push events.
-     *
-     * @return false when Windows refused the registration and the caller has to poll
-     */
     static synchronized boolean addEventSink(IntConsumer sink) {
         ensureLoaded();
         EVENT_SINKS.addIfAbsent(sink);
@@ -153,7 +136,6 @@ final class NativeBackend {
         return eventsRegistered;
     }
 
-    /** Unsubscribes; the last subscriber also drops the native registration and caches. */
     static synchronized void removeEventSink(IntConsumer sink) {
         if (!EVENT_SINKS.remove(sink) || !EVENT_SINKS.isEmpty() || !initialized) {
             return;
@@ -163,7 +145,6 @@ final class NativeBackend {
         FastMediaNative.ClearCache();
     }
 
-    /** @return null when no media session exists */
     static NowPlaying queryNowPlaying() {
         ensureLoaded();
         MediaInfoStruct s = MEDIA_BUF.get();
@@ -182,7 +163,6 @@ final class NativeBackend {
         }
     }
 
-    /** @return null when no media session exists */
     static PlaybackPosition queryPosition() {
         ensureLoaded();
         PositionInfoStruct s = POSITION_BUF.get();
@@ -226,7 +206,6 @@ final class NativeBackend {
         return FastMediaNative.SeekToMs(ms) != 0;
     }
 
-    /** Reference-counted start of the shared capture thread. */
     static synchronized boolean acquireWaveform() {
         ensureLoaded();
         if (waveformUsers == 0 && FastMediaNative.StartAudioCapture() == 0) {
@@ -236,7 +215,6 @@ final class NativeBackend {
         return true;
     }
 
-    /** Stops the capture thread once its last user lets go. */
     static synchronized void releaseWaveform() {
         if (waveformUsers > 0 && --waveformUsers == 0) {
             FastMediaNative.StopAudioCapture();

@@ -37,10 +37,6 @@ using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Media::Control;
 using namespace winrt::Windows::Storage::Streams;
 
-// ---------------------------------------------------------------------------
-// Exported structures
-// ---------------------------------------------------------------------------
-
 #pragma pack(push, 1)
 struct MediaInfo {
     char title[512];
@@ -70,28 +66,18 @@ struct AudioSource {
 #pragma pack(pop)
 
 namespace {
-    // ----- SMTC tuning -----
     constexpr auto kAsyncWaitTimeout = std::chrono::milliseconds(500);
     constexpr auto kPositionCacheWindow = std::chrono::milliseconds(1200);
-    // Players (Spotify, Chromium) publish the new title first and the new thumbnail a moment
-    // later, so the cover keeps being re-probed for a while after every track change.
     constexpr auto kArtSettleWindow = std::chrono::seconds(6);
 
-    // ----- Waveform tuning -----
-    constexpr int kWavePoints = 256;       // ring length the renderer reads back
+    constexpr int kWavePoints = 256;
     static_assert((kWavePoints & (kWavePoints - 1)) == 0, "ring index masking needs a power of two");
-    // 1 s shared-mode buffer: large enough to absorb a slow target re-resolution on the
-    // capture thread without dropping packets (latency is irrelevant for a visualiser).
     constexpr REFERENCE_TIME kCaptureBufferHns = 10000000;
-    constexpr float kLevelAttack = 0.35f;  // smoothing toward louder values
-    constexpr float kLevelRelease = 0.12f; // smoothing toward quieter values
-    constexpr auto kTargetRecheck = std::chrono::seconds(2);   // auto-follow re-resolution rate
+    constexpr float kLevelAttack = 0.35f;
+    constexpr float kLevelRelease = 0.12f;
+    constexpr auto kTargetRecheck = std::chrono::seconds(2);
     constexpr DWORD kActivationTimeoutMs = 2000;
 }
-
-// ---------------------------------------------------------------------------
-// Shared state
-// ---------------------------------------------------------------------------
 
 namespace {
     struct MediaCache {
@@ -124,21 +110,17 @@ namespace {
         HANDLE stopEvent = nullptr;
         bool started = false;
 
-        // 0 = auto-follow the current SMTC session, otherwise an explicit PID.
         std::atomic<uint32_t> requestedPid{0};
-        // Bumped whenever the capture thread must drop its current session.
         std::atomic<uint32_t> generation{0};
-        // PID the capture thread is actually reading, 0 when it fell back to the mix.
         std::atomic<uint32_t> activePid{0};
     };
 
-    // One process that currently owns an audio render session on some endpoint.
     struct AudioSessionCandidate {
         uint32_t pid = 0;
         float peak = 0.0f;
         bool active = false;
-        std::string exeName;   // UTF-8 base name, e.g. "Spotify.exe"
-        std::string aumid;     // UTF-8 package AUMID, empty for unpackaged Win32 processes
+        std::string exeName;
+        std::string aumid;
     };
 
     struct AudioSourceSnapshot {
@@ -161,7 +143,7 @@ namespace {
     struct EventState {
         std::mutex mutex;
         MediaEventCallback callback = nullptr;
-        bool isRegistered = false;   // Java wants events; manager may still be unbound
+        bool isRegistered = false;
         GlobalSystemMediaTransportControlsSessionManager manager = nullptr;
         GlobalSystemMediaTransportControlsSession session = nullptr;
         std::string sessionAumid;
@@ -172,7 +154,6 @@ namespace {
         winrt::event_token tokenTimelinePropertiesChanged{};
     };
 
-    // Lock order (outer -> inner): events.mutex -> sessionManagerMutex / cache.mutex.
     struct GlobalState {
         MediaCache cache;
 
@@ -184,8 +165,6 @@ namespace {
         AudioSourceSnapshot sources;
     };
 
-    // Intentionally leaked: no destructor may touch COM proxies or join threads while the
-    // process is being torn down.
     GlobalState* g_state = nullptr;
     INIT_ONCE g_stateInitOnce = INIT_ONCE_STATIC_INIT;
 
@@ -204,7 +183,6 @@ namespace {
     inline AudioSourceSnapshot& Sources() { return State().sources; }
     inline EventState& Events() { return State().events; }
 
-    // 0 - unknown, 1 - ready for WinRT calls, 2 - unsupported on thread.
     thread_local uint8_t g_apartmentState = 0;
 
     inline bool EnsureApartment() {
@@ -215,8 +193,6 @@ namespace {
             g_apartmentState = 1;
             return true;
         } catch (const winrt::hresult_error& ex) {
-            // If the thread is already in STA mode (e.g. Swing EDT / JavaFX UI thread),
-            // COM is already initialized and WinRT calls can still proceed safely.
             if (ex.code() == RPC_E_CHANGED_MODE) {
                 g_apartmentState = 1;
                 return true;
@@ -230,15 +206,10 @@ namespace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
 namespace {
     inline void CopyToBuffer(char* dest, size_t destSize, const std::string& src) {
         if (!dest || destSize == 0) return;
         size_t len = (std::min)(src.size(), destSize - 1);
-        // Never cut a UTF-8 sequence in half: back off to the start of the code point.
         if (len < src.size()) {
             while (len > 0 && (static_cast<unsigned char>(src[len]) & 0xC0) == 0x80) --len;
         }
@@ -248,7 +219,7 @@ namespace {
 
     uint64_t ComputeAlbumArtFingerprint(const uint8_t* data, size_t len) {
         if (!data || len == 0) return 0;
-        uint64_t hash = 1469598103934665603ULL; // FNV-1a offset
+        uint64_t hash = 1469598103934665603ULL;
         auto mix = [&hash](uint8_t v) {
             hash ^= static_cast<uint64_t>(v);
             hash *= 1099511628211ULL;
@@ -326,18 +297,12 @@ namespace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SMTC session management
-// ---------------------------------------------------------------------------
-
 namespace {
     using SessionManager = GlobalSystemMediaTransportControlsSessionManager;
     using SmtcSession = GlobalSystemMediaTransportControlsSession;
 
     void RebindEvents();
 
-    // Never called with events.mutex held by the caller's own frame on this thread
-    // (RequestAsync can take up to kAsyncWaitTimeout).
     bool TryGetSessionManager(SessionManager* out) {
         *out = nullptr;
         {
@@ -365,8 +330,6 @@ namespace {
 
     enum class Lookup { Ok, NoSession, Error };
 
-    // Distinguishes "nothing is playing" from "could not ask right now" so callers never
-    // report a transient SMTC hiccup as a stopped player.
     Lookup GetActiveSession(SmtcSession& out) {
         out = nullptr;
         SessionManager manager = nullptr;
@@ -374,8 +337,6 @@ namespace {
         try {
             out = manager.GetCurrentSession();
         } catch (...) {
-            // The SMTC host went away (e.g. explorer restart): request a fresh manager next
-            // time and move the push events over to it.
             DropSessionManager(manager);
             RebindEvents();
             return Lookup::Error;
@@ -461,10 +422,6 @@ namespace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Audio source resolution -> per-process capture target
-// ---------------------------------------------------------------------------
-
 namespace {
     std::string WideToUtf8(const wchar_t* data, int length) {
         if (!data || length <= 0) return {};
@@ -487,7 +444,6 @@ namespace {
         return bang == std::string::npos ? aumid : aumid.substr(0, bang);
     }
 
-    // "SpotifyAB.SpotifyMusic_1.2.3.0_x64__zpdnekdrzrea0!Spotify" -> "SpotifyAB.SpotifyMusic"
     std::string PackageFamily(const std::string& aumid) {
         std::string head = BeforeBang(aumid);
         size_t underscore = head.find('_');
@@ -503,7 +459,6 @@ namespace {
         if (pid == 0) return false;
         HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
         if (!proc) {
-            // A live process we are not allowed to query is still a valid capture target.
             return GetLastError() == ERROR_ACCESS_DENIED;
         }
         DWORD exitCode = 0;
@@ -551,7 +506,7 @@ namespace {
         AudioSessionState state = AudioSessionStateInactive;
         control2->GetState(&state);
         control2->Release();
-        if (pid == 0) return; // the system-sounds session has no owner process
+        if (pid == 0) return;
 
         float peak = 0.0f;
         IAudioMeterInformation* meter = nullptr;
@@ -576,7 +531,6 @@ namespace {
         out.push_back(std::move(candidate));
     }
 
-    // Every render endpoint on the machine, reduced to one entry per owning process.
     void EnumerateAudioSources(std::vector<AudioSessionCandidate>& out) {
         out.clear();
 
@@ -622,8 +576,6 @@ namespace {
         for (auto& candidate : out) FillProcessIdentity(candidate);
     }
 
-    // How confidently a candidate process is the owner of an SMTC SourceAppUserModelId.
-    // 0 means "no relationship found".
     int ScoreCandidate(const AudioSessionCandidate& candidate, const std::string& source) {
         if (source.empty() || candidate.pid == 0) return 0;
 
@@ -675,11 +627,9 @@ namespace {
             }
         }
         if (bestPid != 0) return bestPid;
-        // No identity match: when a single process owns all current sound it is the player.
         return activeCount == 1 ? onlyActivePid : 0;
     }
 
-    // false when SMTC could not be asked right now; `out` is empty when nothing is playing.
     bool CurrentSourceAumid(std::string& out) {
         out.clear();
         if (!EnsureApartment()) return false;
@@ -699,7 +649,6 @@ namespace {
         }
     }
 
-    // Sticky SMTC source -> PID resolution, owned by the capture thread.
     struct AutoTarget {
         std::string aumid;
         uint32_t pid = 0;
@@ -708,15 +657,14 @@ namespace {
         uint32_t Resolve() {
             const auto now = std::chrono::steady_clock::now();
             std::string current;
-            // A transient SMTC failure must not flip the capture over to the system mix.
             if (!CurrentSourceAumid(current)) return pid;
             if (current != aumid) {
                 aumid = current;
-                pid = 0; // the player changed, drop the stale target
+                pid = 0;
             } else if (pid != 0 && ProcessAlive(pid)) {
                 return pid;
             } else if (pid == 0 && now - resolvedAt < kTargetRecheck) {
-                return pid; // unresolved: throttle the endpoint rescan
+                return pid;
             }
 
             resolvedAt = now;
@@ -733,8 +681,6 @@ namespace {
 
     struct ProcessLoopbackHandler : IActivateAudioInterfaceCompletionHandler {
         ULONG ref = 1;
-        // Owned by the handler, not by the caller: a completion that arrives after the caller
-        // timed out must still signal a live handle, never a closed (or reused) one.
         HANDLE doneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         HRESULT result = E_FAIL;
         IUnknown* activated = nullptr;
@@ -776,8 +722,6 @@ namespace {
         }
     };
 
-    // Windows 10 20H1+: capture only what the given process tree renders, instead of the
-    // whole endpoint mix. Fails for protected or higher-integrity targets and on older OS.
     HRESULT ActivateProcessLoopbackClient(uint32_t pid, IAudioClient** outClient) {
         if (!outClient) return E_POINTER;
         *outClient = nullptr;
@@ -820,7 +764,7 @@ namespace {
             }
         }
         if (operation) operation->Release();
-        handler->Release(); // a late completion keeps it alive through the operation's own ref
+        handler->Release();
 
         if (FAILED(hr) && *outClient) {
             (*outClient)->Release();
@@ -850,10 +794,6 @@ namespace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WASAPI loopback capture -> waveform (Lock-Free Event-Driven)
-// ---------------------------------------------------------------------------
-
 namespace {
     inline void PushWavePoint(float peak) {
         WaveformState& w = Wave();
@@ -866,7 +806,6 @@ namespace {
         w.level.store(prev + (peak - prev) * k, std::memory_order_relaxed);
     }
 
-    // Drops buffered points so a source switch never shows the previous source's tail.
     inline void ResetWaveBuffer() {
         WaveformState& w = Wave();
         std::fill(std::begin(w.points), std::end(w.points), 0.0f);
@@ -874,7 +813,6 @@ namespace {
         w.level.store(0.0f, std::memory_order_relaxed);
     }
 
-    // Folds samples into one waveform point per ~6 ms of audio (keeps the ring ~1.6 s wide).
     struct WaveBucket {
         uint32_t samplesPerBucket = 1;
         uint32_t count = 0;
@@ -917,7 +855,6 @@ namespace {
                                                    static_cast<uint32_t>(p[2]) << 24) >> 8;
             return static_cast<float>(v) * (1.0f / 8388608.0f);
         } else {
-            // 32-bit container; 24-in-32 samples are left-justified, so the same scale applies.
             int32_t v;
             std::memcpy(&v, p, sizeof(v));
             return static_cast<float>(v) * (1.0f / 2147483648.0f);
@@ -946,7 +883,7 @@ namespace {
             tag = static_cast<WORD>(
                 reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix)->SubFormat.Data1);
         }
-        *stride = mix->nBlockAlign / mix->nChannels; // container size, e.g. 4 for 24-in-32
+        *stride = mix->nBlockAlign / mix->nChannels;
         if (tag == WAVE_FORMAT_IEEE_FLOAT && *stride == 4) return SampleKind::Float32;
         if (tag == WAVE_FORMAT_PCM) {
             switch (*stride) {
@@ -959,9 +896,6 @@ namespace {
         return SampleKind::Unsupported;
     }
 
-    // Runs one capture session against the requested source: a single process when
-    // wantedPid is set, otherwise the default render endpoint (the whole system mix).
-    // Returns when the stop event fires, the target changes, or the device becomes invalid.
     HRESULT RunCaptureSession(uint32_t wantedPid, uint32_t startGeneration, AutoTarget* autoTarget,
                               HANDLE stopEvent, std::atomic<uint32_t>& activePidOut) {
         IMMDeviceEnumerator* enumerator = nullptr;
@@ -987,8 +921,6 @@ namespace {
             if (hAudioEvent) CloseHandle(hAudioEvent);
         };
 
-        // The process-loopback virtual device implements neither GetMixFormat nor
-        // IsFormatSupported, so the shared mix format always comes from a real endpoint.
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                               __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
         if (FAILED(hr)) { cleanup(); return hr; }
@@ -1007,9 +939,6 @@ namespace {
 
         hAudioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-        // Opens and initializes a client on one route (a process, or the endpoint when pid is 0):
-        // event-driven first, timer-polled as fallback. A failed Initialize poisons the client,
-        // so every attempt starts from a fresh activation.
         auto initRoute = [&](uint32_t pid) -> HRESULT {
             HRESULT r = E_FAIL;
             for (int mode = hAudioEvent ? 0 : 1; mode < 2; ++mode) {
@@ -1040,9 +969,6 @@ namespace {
             if (SUCCEEDED(hr)) capturedPid = wantedPid;
         }
         if (FAILED(hr)) {
-            // Per-process capture unavailable (older Windows, protected or elevated target,
-            // dead process, or a format the virtual device refused): fall back to the endpoint
-            // mix so the waveform keeps working.
             hr = initRoute(0);
             if (FAILED(hr)) { cleanup(); return hr; }
         }
@@ -1062,8 +988,6 @@ namespace {
         if (FAILED(hr)) { cleanup(); return hr; }
         started = true;
 
-        // Only the timer-polled fallback needs 1 ms scheduler granularity; raising it
-        // system-wide in event mode would just cost every other process battery.
         if (!eventDriven) {
             timeBeginPeriod(1);
             timerRaised = true;
@@ -1077,20 +1001,15 @@ namespace {
         while (w.running.load(std::memory_order_relaxed)) {
             DWORD waitRes = WaitForMultipleObjects(waitCount, waitHandles, FALSE,
                                                    eventDriven ? 50 : 8);
-            if (waitRes == WAIT_OBJECT_0) break; // stopEvent
+            if (waitRes == WAIT_OBJECT_0) break;
 
-            // The source changed under us (explicit SetWaveformSource or an SMTC session
-            // switch): bail out so the caller restarts against the new target.
             if (w.generation.load(std::memory_order_acquire) != startGeneration) break;
 
             const auto now = std::chrono::steady_clock::now();
             if (now - lastTargetCheck >= kTargetRecheck) {
                 lastTargetCheck = now;
-                // Compared with the *wanted* PID, not the one we fell back to, so a refused
-                // per-process capture does not restart the session on every recheck.
                 if (autoTarget && autoTarget->Resolve() != wantedPid) break;
                 if (!autoTarget && wantedPid != 0 && !ProcessAlive(wantedPid)) break;
-                // The mix is tied to the endpoint; process loopback follows the process.
                 if (capturedPid == 0 && DefaultRenderEndpointId(enumerator) != endpointId) break;
             }
 
@@ -1123,7 +1042,6 @@ namespace {
                             ConsumeFrames<SampleKind::Int32>(data, frames, channels, stride, bucket);
                             break;
                         default:
-                            // Unknown format: keep the ring moving instead of freezing it.
                             bucket.AddSilence(frames);
                             break;
                     }
@@ -1152,17 +1070,12 @@ namespace {
         uint32_t lastTarget = UINT32_MAX;
         while (w.running.load(std::memory_order_relaxed)) {
             HRESULT hr;
-            // Nothing may escape a std::thread entry point: it would call std::terminate and
-            // take the whole JVM down with it.
             try {
-                // Snapshot the generation *before* choosing the target, so a SetWaveformSource
-                // that lands while this session is still starting up ends it right away.
                 const uint32_t generation = w.generation.load(std::memory_order_acquire);
                 const uint32_t requested = w.requestedPid.load(std::memory_order_acquire);
                 uint32_t target;
                 AutoTarget* autoRef;
                 if (requested != 0) {
-                    // A dead manual target degrades to the system mix instead of spinning.
                     target = ProcessAlive(requested) ? requested : 0;
                     autoRef = nullptr;
                 } else {
@@ -1182,17 +1095,13 @@ namespace {
             w.activePid.store(0, std::memory_order_relaxed);
             if (!w.running.load(std::memory_order_relaxed)) break;
             if (FAILED(hr)) {
-                ResetWaveBuffer(); // no frozen picture of the last good audio
+                ResetWaveBuffer();
                 if (WaitForSingleObject(stopEvent, 250) == WAIT_OBJECT_0) break;
             }
         }
         if (apartment) winrt::uninit_apartment();
     }
 }
-
-// ---------------------------------------------------------------------------
-// SMTC push events
-// ---------------------------------------------------------------------------
 
 namespace {
     void NotifyJavaEvent(int32_t eventType) {
@@ -1201,8 +1110,6 @@ namespace {
             std::lock_guard<std::mutex> lock(Events().mutex);
             cb = Events().callback;
         }
-        // Outside the lock: a lock held across a JVM upcall would serialize every WinRT event
-        // thread behind it. Java only enqueues work here and never calls back synchronously.
         if (cb) cb(eventType);
     }
 
@@ -1232,7 +1139,6 @@ namespace {
         try {
             e.session = session;
             e.sessionAumid = winrt::to_string(session.SourceAppUserModelId());
-            // Every change makes the extrapolated position cache stale (seek, pause, new track).
             e.tokenMediaPropertiesChanged = session.MediaPropertiesChanged(
                 [](auto const&, auto const&) {
                     InvalidatePositionCache();
@@ -1278,8 +1184,6 @@ namespace {
             if (!e.isRegistered || !e.manager) return;
             try {
                 SmtcSession current = e.manager.GetCurrentSession();
-                // SessionsChanged also fires when unrelated apps come and go: only re-hook (and
-                // restart an auto-follow capture) when the current session really changed.
                 if (current != e.session) {
                     const std::string before = e.sessionAumid;
                     HookSessionEventsLocked(current);
@@ -1287,7 +1191,6 @@ namespace {
                 }
                 stopped = (current == nullptr);
             } catch (...) {
-                // Unknown state: let Java re-query, which tells "no session" from "error".
             }
         }
         if (sourceChanged && Wave().requestedPid.load(std::memory_order_acquire) == 0) {
@@ -1297,16 +1200,13 @@ namespace {
         NotifyJavaEvent(stopped ? kEventPlaybackStopped : kEventSessionChanged);
     }
 
-    // Binds the push events to the current session manager. Called on registration, when a
-    // lookup notices the events are not bound yet, and when the SMTC host has died.
     void RebindEvents() {
         {
             std::lock_guard<std::mutex> lock(Events().mutex);
             if (!Events().isRegistered) return;
         }
-        // Fetched before taking events.mutex: RequestAsync may block for kAsyncWaitTimeout.
         SessionManager manager = nullptr;
-        if (!TryGetSessionManager(&manager)) return; // retried on the next session lookup
+        if (!TryGetSessionManager(&manager)) return;
 
         std::lock_guard<std::mutex> lock(Events().mutex);
         EventState& e = Events();
@@ -1324,11 +1224,6 @@ namespace {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point bodies (C++ linkage, so the try/catch in the exports below is honoured
-// under /EHsc). Return codes: 1 = ok, 0 = no media session, -1 = transient failure.
-// ---------------------------------------------------------------------------
 
 namespace {
     int32_t GetCurrentMediaInfoBody(MediaInfo* info) {
@@ -1374,13 +1269,10 @@ namespace {
                 const bool settling =
                     Cache().lastTrackChange != std::chrono::steady_clock::time_point{} &&
                     now - Cache().lastTrackChange < kArtSettleWindow;
-                // A new track on the same album keeps its cover; otherwise keep probing while
-                // the player may still be swapping the thumbnail in after the title.
                 shouldProbe = needsInitialArt || (trackChangedPreview ? !sameAlbum : settling);
                 if (shouldProbe) Cache().lastAlbumArtProbe = now;
             }
 
-            // Blocking thumbnail fetch happens outside the cache lock
             bool thumbAvailable = false;
             if (shouldProbe) {
                 try {
@@ -1432,9 +1324,6 @@ namespace {
                     Cache().lastTrackChange = now;
                 }
 
-                // The cover is handed out on every call (an independent copy Java frees through
-                // FreeMediaInfo): change detection lives on the caller's side, so no caller can
-                // "consume" a change another caller still needs to see.
                 if (Cache().albumArt && Cache().albumArtSize > 0) {
                     info->albumArtPng = static_cast<uint8_t*>(CoTaskMemAlloc(Cache().albumArtSize));
                     if (info->albumArtPng) {
@@ -1470,8 +1359,6 @@ namespace {
         std::memset(info, 0, sizeof(PositionInfo));
         if (!EnsureApartment()) return -1;
 
-        // Serve from position cache when within window to avoid redundant COM IPC. Every SMTC
-        // event and transport command invalidates it, so it never hides a real change.
         {
             std::lock_guard<std::mutex> lock(Cache().mutex);
             if (Cache().lastUpdate != std::chrono::steady_clock::time_point{}) {
@@ -1573,7 +1460,6 @@ namespace {
             if (op.Status() == AsyncStatus::Completed) {
                 return op.GetResults() ? 1 : 0;
             }
-            // Fast non-blocking wait (up to 30ms) for immediate feedback without freezing UI
             auto ctx = std::make_shared<AsyncWaitContext>();
             if (ctx->hEvent) {
                 op.Completed([ctx](auto const&, AsyncStatus) {
@@ -1584,7 +1470,6 @@ namespace {
                     return op.GetResults() ? 1 : 0;
                 }
             }
-            // If still in-flight, let it complete in background (do NOT cancel)
             return 1;
         } catch (...) {
             return 0;
@@ -1600,7 +1485,6 @@ namespace {
         w.activePid.store(0, std::memory_order_relaxed);
         w.running.store(true, std::memory_order_relaxed);
         try {
-            // The thread gets its own copy of the handle; it is closed only after the join.
             w.thread = std::thread(CaptureThreadMain, w.stopEvent);
         } catch (...) {
             w.running.store(false, std::memory_order_relaxed);
@@ -1632,7 +1516,6 @@ namespace {
         w.activePid.store(0, std::memory_order_relaxed);
     }
 
-    // Lock-free read of recent waveform points oldest->newest into outBuffer.
     int32_t GetWaveformBody(float* outBuffer, int32_t maxSamples) {
         if (!outBuffer || maxSamples <= 0) return 0;
         WaveformState& w = Wave();
@@ -1648,8 +1531,6 @@ namespace {
         return count;
     }
 
-    // Re-scans every render endpoint and snapshots the processes that own an audio session.
-    // Returns the snapshot size; read it back with GetAudioSource.
     int32_t RefreshAudioSourcesBody() {
         if (!EnsureApartment()) return 0;
         std::vector<AudioSessionCandidate> candidates;
@@ -1677,7 +1558,6 @@ namespace {
         return 1;
     }
 
-    // pid == 0 restores auto-follow of the current SMTC session.
     int32_t SetWaveformSourceBody(int32_t pid) {
         if (pid < 0) return 0;
         if (pid != 0 && !ProcessAlive(static_cast<uint32_t>(pid))) return 0;
@@ -1688,14 +1568,7 @@ namespace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Exported entry points. No SEH here on purpose: swallowing an access violation would leave
-// whatever std::mutex was held locked forever (destructors do not run under /EHsc), turning a
-// crash into a silent permanent hang. C++ exceptions are still stopped at the boundary.
-// ---------------------------------------------------------------------------
-
 extern "C" {
-
     __declspec(dllexport) int32_t __stdcall GetCurrentMediaInfo(MediaInfo* info) {
         try { return GetCurrentMediaInfoBody(info); } catch (...) { return -1; }
     }
@@ -1765,7 +1638,6 @@ extern "C" {
         try { return SetWaveformSourceBody(pid); } catch (...) { return 0; }
     }
 
-    // PID actually being captured right now; 0 means the whole system mix.
     __declspec(dllexport) int32_t __stdcall GetWaveformSourcePid() {
         return static_cast<int32_t>(Wave().activePid.load(std::memory_order_relaxed));
     }

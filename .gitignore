@@ -1,36 +1,14 @@
-### IntelliJ IDEA ###
 out/
-!**/src/main/**/out/
-!**/src/test/**/out/
-
-### Eclipse ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-bin/
-!**/src/main/**/bin/
-!**/src/test/**/bin/
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-
-### VS Code ###
+native/
+.idea/
+*.iml
 .vscode/
-
-### Mac OS ###
+.qwen/
 .DS_Store
+album.png
 
-### CMake / C++ Build ###
 cpp/build/
 cpp/cmake-build-*/
 cpp/.idea/
 CMakeSettings.json
-resource/assets/
+CppProperties.json

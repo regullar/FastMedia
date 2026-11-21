@@ -4,7 +4,6 @@ import com.sun.jna.Callback;
 import com.sun.jna.Native;
 import com.sun.jna.NativeLibrary;
 public final class FastMediaNative {
-
     public interface MediaEventCallback extends Callback {
         void invoke(int eventType);
     }
@@ -77,4 +76,3 @@ public final class FastMediaNative {
 
     public static native int GetWaveformSourcePid();
 }
-

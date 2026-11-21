@@ -24,12 +24,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
-/**
- * Threading model: every native query and every state write happens on one worker thread, so
- * the state needs no locks; public getters only read immutable snapshots. Listener callbacks
- * run in order on a separate callback thread, so a slow listener never stalls polling.
- * Several sessions may be open at once: they share the native backend.
- */
 public final class MediaSession implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger(MediaSession.class.getName());
     private static final long TICK_MS = 500L;
@@ -43,7 +37,6 @@ public final class MediaSession implements AutoCloseable {
     private static final int LYRICS_MISSES_LIMIT = 256;
     private static final Pattern NORMALIZE_PATTERN = Pattern.compile("[^\\p{L}\\p{Nd}]+");
 
-    /** Position at a moment in time; extrapolated on read. */
     private record Anchor(boolean playing, long durationMs, long positionMs, long atNanos) {
         PlaybackPosition at(long nowNanos) {
             long elapsedMs = playing ? Math.max(0L, (nowNanos - atNanos) / 1_000_000L) : 0L;
@@ -67,7 +60,6 @@ public final class MediaSession implements AutoCloseable {
     private final Object waveformLock = new Object();
     private volatile boolean waveformAcquired = false;
 
-    // Written only by the worker; null while nothing is playing.
     private volatile NowPlaying current;
     private volatile Anchor anchor;
     private long lastNativeSyncNanos;
@@ -82,10 +74,6 @@ public final class MediaSession implements AutoCloseable {
         this.lyricsExecutor = Executors.newFixedThreadPool(4, r -> daemon(r, "FastMedia-Lyrics"));
     }
 
-    /**
-     * Opens a session. The current track (if any) is already known when this returns, and
-     * {@link #addListener} replays it to every new listener.
-     */
     public static MediaSession open() {
         NativeBackend.load();
         MediaSession session = new MediaSession();
@@ -111,8 +99,6 @@ public final class MediaSession implements AutoCloseable {
         worker.scheduleWithFixedDelay(this::refreshMetadata, heartbeat, heartbeat, TimeUnit.MILLISECONDS);
     }
 
-    // ----- Native events (WinRT threads) -----
-
     private void onNativeEvent(int eventType) {
         if (closed.get()) {
             return;
@@ -120,7 +106,6 @@ public final class MediaSession implements AutoCloseable {
         switch (eventType) {
             case FastMediaNative.EVENT_MEDIA_PROPERTIES_CHANGED:
             case FastMediaNative.EVENT_SESSION_CHANGED:
-                // Players fire these in bursts; one queued refresh covers the whole burst.
                 if (metadataQueued.compareAndSet(false, true)) {
                     runOnWorker(() -> {
                         metadataQueued.set(false);
@@ -142,8 +127,6 @@ public final class MediaSession implements AutoCloseable {
         }
     }
 
-    // ----- Worker thread -----
-
     private void refreshMetadata() {
         if (closed.get()) {
             return;
@@ -152,7 +135,6 @@ public final class MediaSession implements AutoCloseable {
         try {
             np = NativeBackend.queryNowPlaying();
         } catch (RuntimeException e) {
-            // Includes TransientFailure: keep the last known state rather than flicker to "stopped".
             LOG.log(Level.FINE, "[FastMedia] metadata refresh failed", e);
             return;
         }
@@ -161,8 +143,6 @@ public final class MediaSession implements AutoCloseable {
             return;
         }
         NowPlaying previous = current;
-        // Decided here rather than trusting the native flag: that flag is process-wide and is
-        // consumed by whichever session asks first.
         boolean changed = previous == null
                 || !np.title().equals(previous.title())
                 || !np.artist().equals(previous.artist())
@@ -184,11 +164,10 @@ public final class MediaSession implements AutoCloseable {
         Anchor before = anchor;
         PlaybackPosition pos = refreshPosition();
         if (pos != null && before != null && before.playing() != pos.playing()) {
-            refreshMetadata(); // keeps nowPlaying().isPlaying() in step
+            refreshMetadata();
         }
     }
 
-    /** @return the fresh position, or null when there is none (stopped, closed or transient) */
     private PlaybackPosition refreshPosition() {
         if (closed.get()) {
             return null;
@@ -206,7 +185,6 @@ public final class MediaSession implements AutoCloseable {
             return null;
         }
         if (current == null) {
-            // Media appeared without a metadata event: fetch the track as well.
             refreshMetadata();
             return pos;
         }
@@ -221,7 +199,6 @@ public final class MediaSession implements AutoCloseable {
             return;
         }
         long now = System.nanoTime();
-        // Resync even while paused: that is how a resume is noticed if an event is missed.
         if (now - lastNativeSyncNanos >= NATIVE_RESYNC_NANOS) {
             refreshPosition();
             return;
@@ -249,23 +226,13 @@ public final class MediaSession implements AutoCloseable {
         try {
             worker.execute(task);
         } catch (RejectedExecutionException ignored) {
-            // closing
         }
     }
 
-    // ----- Public API -----
-
-    /**
-     * @return the current track as last reported by the system, or null when nothing is playing.
-     * Never blocks.
-     */
     public NowPlaying nowPlaying() {
         return current;
     }
 
-    /**
-     * @return the extrapolated playback position, or null when nothing is playing. Never blocks.
-     */
     public PlaybackPosition position() {
         Anchor a = anchor;
         return a == null ? null : a.at(System.nanoTime());
@@ -299,8 +266,6 @@ public final class MediaSession implements AutoCloseable {
         long target = Math.max(0L, positionMs);
         boolean ok = NativeBackend.seek(target);
         if (ok) {
-            // Move the anchor right away instead of drifting from the old position until the
-            // player reports the new timeline.
             runOnWorker(() -> {
                 Anchor a = anchor;
                 if (a != null) {
@@ -313,10 +278,6 @@ public final class MediaSession implements AutoCloseable {
         return ok;
     }
 
-    /**
-     * Adds a listener. If a track is already playing it is replayed to this listener at once,
-     * so nothing is missed by registering after {@link #open()}.
-     */
     public void addListener(MediaListener listener) {
         if (listener == null || !listeners.addIfAbsent(listener)) {
             return;
@@ -354,36 +315,18 @@ public final class MediaSession implements AutoCloseable {
         return NativeBackend.audioLevel();
     }
 
-    /**
-     * Processes that currently own an audio render session, each usable as a waveform source.
-     * Scans every audio endpoint, so call it on demand rather than per frame.
-     */
     public List<AudioSource> audioSources() {
         return NativeBackend.listAudioSources();
     }
 
-    /**
-     * Captures only {@code pid}'s audio instead of the whole system mix. Windows refuses
-     * per-process capture for protected or elevated targets, in which case the capture
-     * silently falls back to the system mix. The waveform source is process-wide: it applies
-     * to every open session.
-     *
-     * @return false if no such process is running
-     */
     public boolean setWaveformSource(int pid) {
         return NativeBackend.setWaveformSource(Math.max(0, pid));
     }
 
-    /**
-     * Follows the app that owns the current media session. This is the default.
-     */
     public void setWaveformSourceAuto() {
         NativeBackend.setWaveformSource(0);
     }
 
-    /**
-     * @return the PID actually being captured, or 0 when the whole system mix is used
-     */
     public int waveformSourcePid() {
         return NativeBackend.waveformSourcePid();
     }
@@ -480,7 +423,6 @@ public final class MediaSession implements AutoCloseable {
         try {
             callbackExecutor.execute(task);
         } catch (RejectedExecutionException ignored) {
-            // closing
         }
     }
 

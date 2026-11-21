@@ -7,7 +7,6 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 public final class LyricsParser {
-
     private static final Pattern LRC_TIME =
             Pattern.compile("\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{1,3}))?]");
     private static final Pattern LINE_SPLIT = Pattern.compile("\\R");

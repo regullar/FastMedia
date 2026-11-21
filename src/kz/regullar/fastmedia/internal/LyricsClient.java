@@ -55,7 +55,6 @@ public final class LyricsClient {
         String primaryArtist = primaryArtist(rawArtist);
         String strippedTitle = stripTrackDecorations(rawTitle);
 
-        // Put the most canonical candidate first (LRCLIB index matches primary + clean title)
         Set<Candidate> candidates = new LinkedHashSet<>();
         candidates.add(new Candidate(primaryArtist, strippedTitle));
         candidates.add(new Candidate(rawArtist, rawTitle));
@@ -76,7 +75,6 @@ public final class LyricsClient {
         String bestPlain = null;
         boolean transientError = false;
 
-        // Try primary candidate first
         try {
             String path = "/api/get?artist_name=" + urlEncode(first.artist())
                     + "&track_name=" + urlEncode(first.track());
@@ -97,7 +95,6 @@ public final class LyricsClient {
             transientError = true;
         }
 
-        // If primary candidate didn't yield synced lyrics, query remaining candidates concurrently
         if (bestSynced == null && candidateList.size() > 1) {
             List<CompletableFuture<LyricsJsonParser.LyricsRaw>> futures = new java.util.ArrayList<>();
             for (int i = 1; i < candidateList.size(); i++) {
@@ -133,7 +130,6 @@ public final class LyricsClient {
             }
         }
 
-        // Fallback search if synced lyrics weren't found directly
         if (bestSynced == null) {
             String query = primaryArtist.isEmpty() ? strippedTitle : (primaryArtist + " " + strippedTitle);
             if (!query.isBlank()) {

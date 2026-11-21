@@ -2,7 +2,6 @@ package kz.regullar.fastmedia;
 
 import java.time.Duration;
 public record PlaybackPosition(boolean playing, long durationMs, long positionMs) {
-
     public Duration duration() {
         return Duration.ofMillis(durationMs);
     }

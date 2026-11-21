@@ -2,7 +2,6 @@ package kz.regullar.fastmedia;
 
 import java.util.List;
 public final class Lyrics {
-
     public enum Kind {SYNCED, PLAIN, NONE}
 
     private static final Lyrics NOT_FOUND = new Lyrics(Kind.NONE, List.of(), List.of(), true);

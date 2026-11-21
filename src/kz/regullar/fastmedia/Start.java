@@ -1,7 +1,6 @@
 package kz.regullar.fastmedia;
 
 public final class Start {
-
     public static void main(String[] args) throws InterruptedException {
         try (MediaSession session = MediaSession.open()) {
             session.addListener(new MediaListener() {
